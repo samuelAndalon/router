@@ -1,4 +1,6 @@
 //! Configuration for datadog tracing.
+use opentelemetry::Key;
+use opentelemetry::Value;
 use opentelemetry::sdk::trace::BatchSpanProcessor;
 use opentelemetry::sdk::trace::Builder;
 use schemars::JsonSchema;
@@ -39,12 +41,84 @@ impl TracingConfigurator for Config {
             .with(&url, |b, e| {
                 b.with_agent_endpoint(e.to_string().trim_end_matches('/'))
             })
-            .with_service_name_mapping(move |span, _model_config|{
+            .with_service_name_mapping(|span, _model_config|{
                 tracing::info!("spanName: {}", span.name);
                 for (key, value) in span.attributes.iter() {
                     tracing::info!("spanDataAttributes key: {}, value: {}", key, value);
                 }
+                if span.name == "request" {
+                    return "supergraph.request";
+                } else if span.name == "router" {
+                    return "supergraph.router";
+                } else if span.name == "request" {
+                    return "supergraph.parse_query";
+                } else if span.name == "supergraph" {
+                    return "supergraph.operation";
+                } else if span.name == "query_planning" {
+                    return "supergraph.query_planning";
+                } else if span.name == "execution" {
+                    return "supergraph.execute";
+                } else if span.name == "fetch" {
+                    return "supergraph.fetch";
+                } else if span.name == "subgraph" {
+                    return "subgraph.operation";
+                } else if span.name == "subgraph_request" {
+                    return "subgraph.service";
+                }
                 return "apollo_router";
+            })
+            .with_resource_mapping(|span, _model_config|{
+                if span.name == "request" {
+                    let value =
+                        span.attributes
+                            .get(&Key::from_static_str("http.method"))
+                            .unwrap();
+                    return match value {
+                        Value::String(value) => value.as_str(),
+                        _ => span.name.as_ref()
+                    }
+                } else if span.name == "router" {
+                    return span.name.as_ref();
+                } else if span.name == "request" {
+                    return span.name.as_ref();
+                } else if span.name == "supergraph" {
+                    let value = span.attributes
+                        .get(&Key::from_static_str("graphql.operation.name"))
+                        .unwrap();
+                    return match value {
+                        Value::String(value) => value.as_str(),
+                        _ => span.name.as_ref()
+                    }
+                } else if span.name == "query_planning" {
+                    let value = span.attributes
+                        .get(&Key::from_static_str("graphql.operation.name"))
+                        .unwrap();
+                    return match value {
+                        Value::String(value) => value.as_str(),
+                        _ => span.name.as_ref()
+                    }
+                } else if span.name == "execution" {
+                    return span.name.as_ref();
+                } else if span.name == "fetch" {
+                    return span.name.as_ref();
+                } else if span.name == "subgraph" {
+                    let value = span.attributes
+                        .get(&Key::from_static_str("graphql.operation.name"))
+                        .unwrap();
+                    return match value {
+                        Value::String(value) => value.as_str(),
+                        _ => span.name.as_ref()
+                    }
+                } else if span.name == "subgraph_request" {
+                    let value = span.attributes
+                        .get(&Key::from_static_str("apollo.subgraph.name"))
+                        .unwrap();
+                    return match value {
+                        Value::String(value) => value.as_str(),
+                        _ => span.name.as_ref()
+                    }
+                }
+                return span.name.as_ref();
             })
             .with_trace_config(trace_config.into())
             .build_exporter()?;
