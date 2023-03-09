@@ -41,7 +41,7 @@ impl TracingConfigurator for Config {
             .with(&url, |b, e| {
                 b.with_agent_endpoint(e.to_string().trim_end_matches('/'))
             })
-            .with_service_name_mapping(|span, _model_config|{
+            .with_name_mapping(|span, _model_config|{
                 tracing::info!("spanName: {}", span.name);
                 for (key, value) in span.attributes.iter() {
                     tracing::info!("spanDataAttributes key: {}, value: {}", key, value);
