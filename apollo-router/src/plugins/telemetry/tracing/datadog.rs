@@ -1,4 +1,6 @@
 //! Configuration for datadog tracing.
+use lazy_static::lazy_static;
+use std::collections::HashMap;
 use opentelemetry::Key;
 use opentelemetry::Value;
 use opentelemetry::sdk::trace::BatchSpanProcessor;
@@ -16,6 +18,32 @@ use crate::plugins::telemetry::config::Trace;
 use crate::plugins::telemetry::tracing::BatchProcessorConfig;
 use crate::plugins::telemetry::tracing::SpanProcessorExt;
 use crate::plugins::telemetry::tracing::TracingConfigurator;
+
+lazy_static! {
+    static ref SPAN_NAME_MAPPING: HashMap<&'static str, &'static str> = {
+        let mut map = HashMap::new();
+        map.insert("request", "supergraph.request");
+        map.insert("router", "supergraph.router");
+        map.insert("parse_query", "supergraph.parse_query");
+        map.insert("supergraph", "supergraph.operation");
+        map.insert("query_planning", "supergraph.query_planning");
+        map.insert("execution", "supergraph.execute");
+        map.insert("fetch", "supergraph.fetch");
+        map.insert("subgraph", "subgraph.operation");
+        map.insert("subgraph_request", "subgraph.request");
+        map
+    };
+
+    static ref SPAN_RESOURCE_ATTRIBUTE_MAPPING: HashMap<&'static str, &'static str> = {
+        let mut map = HashMap::new();
+        map.insert("request", "http.method");
+        map.insert("supergraph", "graphql.operation.name");
+        map.insert("query_planning", "graphql.operation.name");
+        map.insert("subgraph", "graphql.operation.name");
+        map.insert("subgraph_request", "graphql.operation.name");
+        map
+    };
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -42,81 +70,21 @@ impl TracingConfigurator for Config {
                 b.with_agent_endpoint(e.to_string().trim_end_matches('/'))
             })
             .with_service_name(trace_config.service_name.clone())
-            .with_name_mapping(|span, _model_config|{
-                if span.name == "request" {
-                    return "supergraph.request";
-                } else if span.name == "router" {
-                    return "supergraph.router";
-                } else if span.name == "request" {
-                    return "supergraph.parse_query";
-                } else if span.name == "supergraph" {
-                    return "supergraph.operation";
-                } else if span.name == "query_planning" {
-                    return "supergraph.query_planning";
-                } else if span.name == "execution" {
-                    return "supergraph.execute";
-                } else if span.name == "fetch" {
-                    return "supergraph.fetch";
-                } else if span.name == "subgraph" {
-                    return "subgraph.operation";
-                } else if span.name == "subgraph_request" {
-                    return "subgraph.service";
-                }
-                return "apollo_router";
-            })
-            .with_resource_mapping(|span, _model_config|{
-                if span.name == "request" {
-                    let value =
-                        span.attributes
-                            .get(&Key::from_static_str("http.method"))
-                            .unwrap();
-                    return match value {
-                        Value::String(value) => value.as_str(),
-                        _ => span.name.as_ref()
-                    }
-                } else if span.name == "router" {
-                    return span.name.as_ref();
-                } else if span.name == "request" {
-                    return span.name.as_ref();
-                } else if span.name == "supergraph" {
-                    let value = span.attributes
-                        .get(&Key::from_static_str("graphql.operation.name"))
-                        .unwrap();
-                    return match value {
-                        Value::String(value) => value.as_str(),
-                        _ => span.name.as_ref()
-                    }
-                } else if span.name == "query_planning" {
-                    let value = span.attributes
-                        .get(&Key::from_static_str("graphql.operation.name"))
-                        .unwrap();
-                    return match value {
-                        Value::String(value) => value.as_str(),
-                        _ => span.name.as_ref()
-                    }
-                } else if span.name == "execution" {
-                    return span.name.as_ref();
-                } else if span.name == "fetch" {
-                    return span.name.as_ref();
-                } else if span.name == "subgraph" {
-                    let value = span.attributes
-                        .get(&Key::from_static_str("graphql.operation.name"))
-                        .unwrap();
-                    return match value {
-                        Value::String(value) => value.as_str(),
-                        _ => span.name.as_ref()
-                    }
-                } else if span.name == "subgraph_request" {
-                    let value = span.attributes
-                        .get(&Key::from_static_str("apollo.subgraph.name"))
-                        .unwrap();
-                    return match value {
-                        Value::String(value) => value.as_str(),
-                        _ => span.name.as_ref()
-                    }
-                }
-                return span.name.as_ref();
-            })
+            .with_name_mapping(|span, _model_config|
+                SPAN_NAME_MAPPING.get(span.name.as_ref())
+                    .unwrap_or(&"apollo_router")
+            )
+            .with_resource_mapping(|span, _model_config|
+                SPAN_RESOURCE_ATTRIBUTE_MAPPING
+                    .get(span.name.as_ref())
+                    .and_then(|key| span.attributes.get(&Key::from_static_str(key)))
+                    .and_then(|value| match value {
+                        Value::String(value) => Some(value.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or(span.name.as_ref())
+
+            )
             .with_trace_config(trace_config.into())
             .build_exporter()?;
 
