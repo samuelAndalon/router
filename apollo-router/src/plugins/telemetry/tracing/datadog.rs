@@ -36,7 +36,7 @@ lazy_static! {
 
     static ref SPAN_RESOURCE_ATTRIBUTE_MAPPING: HashMap<&'static str, &'static str> = {
         let mut map = HashMap::new();
-        map.insert("request", "http.method");
+        map.insert("request", "http.route");
         map.insert("supergraph", "graphql.operation.name");
         map.insert("query_planning", "graphql.operation.name");
         map.insert("subgraph", "graphql.operation.name");
