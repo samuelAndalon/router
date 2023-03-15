@@ -25,8 +25,8 @@ lazy_static! {
         map.insert("request", "http.route");
         map.insert("supergraph", "graphql.operation.name");
         map.insert("query_planning", "graphql.operation.name");
-        map.insert("subgraph", "graphql.operation.name");
-        map.insert("subgraph_request", "apollo.subgraph.name");
+        map.insert("subgraph", "apollo.subgraph.name");
+        map.insert("subgraph_request", "graphql.operation.name");
         map
     };
 }
