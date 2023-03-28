@@ -7,9 +7,9 @@ use axum::body::StreamBody;
 use axum::response::*;
 use bytes::Buf;
 use bytes::Bytes;
-use futures::future::ready;
+use futures::future::{join_all, ready};
 use futures::future::BoxFuture;
-use futures::stream;
+use futures::{future, stream};
 use futures::stream::once;
 use futures::stream::StreamExt;
 use http::header::CONTENT_TYPE;
@@ -42,7 +42,7 @@ use super::HasPlugins;
 use super::SupergraphCreator;
 use super::MULTIPART_DEFER_CONTENT_TYPE;
 use crate::cache::DeduplicatingCache;
-use crate::graphql;
+use crate::{Context, graphql};
 #[cfg(test)]
 use crate::plugin::test::MockSupergraphService;
 use crate::router_factory::RouterFactory;
@@ -53,7 +53,16 @@ use crate::services::SupergraphRequest;
 use crate::services::SupergraphResponse;
 use crate::Configuration;
 use crate::Endpoint;
+use crate::graphql::Request;
 use crate::ListenAddr;
+use crate::request::GraphQLHttpRequest;
+
+const IS_BATCH_REQUEST_CONTEXT_KEY: &str = "is_batch_request";
+
+enum ExecuteRequestResult {
+    Single(SupergraphResponse),
+    Batch(Vec<SupergraphResponse>),
+}
 
 /// Containing [`Service`] in the request lifecyle.
 #[derive(Clone)]
@@ -171,85 +180,114 @@ where
         } = req;
 
         let (parts, body) = router_request.into_parts();
+        let method_is_get = parts.method == Method::GET;
+        let query = parts.uri.query().map(|s| s.to_string());
 
         let supergraph_creator = self.supergraph_creator.clone();
         let apq = self.apq_layer.clone();
 
         let fut = async move {
-            let graphql_request: Result<graphql::Request, (&str, String)> = if parts.method
-                == Method::GET
-            {
-                parts
-                    .uri
-                    .query()
-                    .map(|q| {
-                        graphql::Request::from_urlencoded_query(q.to_string()).map_err(|e| {
-                            (
-                                "failed to decode a valid GraphQL request from path",
-                                format!("failed to decode a valid GraphQL request from path {e}"),
-                            )
-                        })
+            let graphql_request: Result<GraphQLHttpRequest, (&str, String)> =
+                if method_is_get {
+                    query.map(|q| {
+                        Request::from_urlencoded_query(q.to_string())
+                            .map_err(|e| {
+                                (
+                                    "failed to decode a valid GraphQL request from path",
+                                    format!("failed to decode a valid GraphQL request from path {e}"),
+                                )
+                            })
+                            .map(|request| {
+                                GraphQLHttpRequest::Single(request.clone())
+                            })
                     })
                     .unwrap_or_else(|| {
                         Err(("missing query string", "missing query string".to_string()))
                     })
-            } else {
-                hyper::body::to_bytes(body)
-                    .await
-                    .map_err(|e| {
-                        (
-                            "failed to get the request body",
-                            format!("failed to get the request body: {e}"),
-                        )
-                    })
-                    .and_then(|bytes| {
-                        serde_json::from_reader(bytes.reader()).map_err(|err| {
+                }
+                else {
+                    hyper::body::to_bytes(body).await
+                        .map_err(|e| {
                             (
-                                "failed to deserialize the request body into JSON",
-                                format!("failed to deserialize the request body into JSON: {err}"),
+                                "failed to get the request body",
+                                format!("failed to get the request body: {e}"),
                             )
                         })
-                    })
-            };
+                        .and_then(|bytes| {
+                            serde_json::from_reader(bytes.reader())
+                                .map_err(|err| {
+                                    (
+                                        "failed to deserialize the request body into JSON",
+                                        format!("failed to deserialize the request body into JSON: {err}"),
+                                    )
+                                })
+                        })
+                };
 
             match graphql_request {
                 Ok(graphql_request) => {
-                    let request = SupergraphRequest {
-                        supergraph_request: http::Request::from_parts(parts, graphql_request),
-                        context,
+                    let execute_request_result =
+                        match graphql_request {
+                            GraphQLHttpRequest::Single(single_request) => {
+                                let supergraph_request = SupergraphRequest {
+                                    supergraph_request: http::Request::from_parts(parts, single_request),
+                                    context,
+                                };
+                                ExecuteRequestResult::Single(
+                                    match should_execute_request(
+                                        apq.supergraph_request(supergraph_request).await
+                                    ) {
+                                        Err(response) => response,
+                                        Ok(request) => {
+                                            supergraph_creator.create().oneshot(request).await.unwrap()
+                                        },
+                                    }
+                                )
+                            }
+                        GraphQLHttpRequest::Batch(batch_request) => {
+                            let futures = batch_request.into_iter().map(|request| async {
+                                let supergraph_request = SupergraphRequest {
+                                    // supergraph_request: http::Request::from_parts(parts, request),
+                                    // context
+                                    supergraph_request: http::Request::new(request),
+                                    context: Context::new()
+                                };
+                                match should_execute_request(
+                                    apq.supergraph_request(supergraph_request).await
+                                ) {
+                                    Err(response) => response,
+                                    Ok(request) => supergraph_creator.create().oneshot(request).await.unwrap(),
+                                }
+                            });
+                            ExecuteRequestResult::Batch(join_all(futures).await)
+                        }
                     };
 
-                    let request_res = apq.supergraph_request(request).await;
+                    let SupergraphResponse { response, context } = match execute_request_result {
+                        ExecuteRequestResult::Single(supergraph_response) => {
+                            supergraph_response
+                        }
+                        ExecuteRequestResult::Batch(supergraph_responses) => {
+                            // let first_response = supergraph_responses.first().unwrap();
 
-                    let SupergraphResponse { response, context } =
-                        match request_res.and_then(|request| {
-                            let query = request.supergraph_request.body().query.as_ref();
+                            let first_response_context = supergraph_responses.first().unwrap().context.clone();
+                            first_response_context.insert(IS_BATCH_REQUEST_CONTEXT_KEY, true).unwrap();
 
-                            if query.is_none() || query.unwrap().trim().is_empty() {
-                                let errors = vec![crate::error::Error::builder()
-                                    .message("Must provide query string.".to_string())
-                                    .extension_code("MISSING_QUERY_STRING")
-                                    .build()];
-                                tracing::error!(
-                                    monotonic_counter.apollo_router_http_requests_total = 1u64,
-                                    status = %StatusCode::BAD_REQUEST.as_u16(),
-                                    error = "Must provide query string",
-                                    "Must provide query string"
-                                );
+                            // let (first_parts, _) =  first_response.response.into_parts();
+                            let futures =
+                                supergraph_responses.into_iter().map(|mut supergraph_response| async move {
+                                    supergraph_response.next_response().await.unwrap()
+                                });
 
-                                Err(SupergraphResponse::builder()
-                                    .errors(errors)
-                                    .status_code(StatusCode::BAD_REQUEST)
-                                    .context(request.context)
-                                    .build()
-                                    .expect("response is valid"))
-                            } else {
-                                Ok(request)
+                            let response_stream = stream::iter(future::join_all(futures).await).boxed();
+
+                            SupergraphResponse {
+                                // response: Response::from_parts(supergraph_responses.first().unwrap().response.into_parts().0, response_stream),
+                                response: Response::new(response_stream),
+                                context: first_response_context
                             }
-                        }) {
-                            Err(response) => response,
-                            Ok(request) => supergraph_creator.create().oneshot(request).await?,
-                        };
+                        }
+                    };
 
                     let accepts_wildcard: bool = context
                         .get(ACCEPTS_WILDCARD_CONTEXT_KEY)
@@ -263,6 +301,10 @@ where
                         .get(ACCEPTS_MULTIPART_CONTEXT_KEY)
                         .unwrap_or_default()
                         .unwrap_or_default();
+                    let is_batch_request: bool = context
+                        .get(IS_BATCH_REQUEST_CONTEXT_KEY)
+                        .unwrap_or_default()
+                        .unwrap_or(false);
 
                     let (mut parts, mut body) = response.into_parts();
                     process_vary_header(&mut parts.headers);
@@ -281,9 +323,7 @@ where
                             })
                         }
                         Some(response) => {
-                            if !response.has_next.unwrap_or(false)
-                                && (accepts_json || accepts_wildcard)
-                            {
+                            if (!response.has_next.unwrap_or(false) || is_batch_request) && (accepts_json || accepts_wildcard) {
                                 parts.headers.insert(
                                     CONTENT_TYPE,
                                     HeaderValue::from_static(APPLICATION_JSON.essence_str()),
@@ -298,7 +338,8 @@ where
                                         context,
                                     })
                                 })
-                            } else if accepts_multipart {
+                            }
+                            else if accepts_multipart {
                                 parts.headers.insert(
                                     CONTENT_TYPE,
                                     HeaderValue::from_static(MULTIPART_DEFER_CONTENT_TYPE),
@@ -354,7 +395,8 @@ where
                                     });
 
                                 Ok(RouterResponse { response, context })
-                            } else {
+                            }
+                            else {
                                 // this should be unreachable due to a previous check, but just to be sure...
                                 Ok(router::Response {
                                 response: http::Response::builder()
@@ -412,6 +454,33 @@ where
         };
         Box::pin(fut)
     }
+}
+
+fn should_execute_request(apq_result: Result<SupergraphRequest, SupergraphResponse>) -> Result<SupergraphRequest, SupergraphResponse> {
+    return apq_result.and_then(|request| {
+        let query = request.supergraph_request.body().query.as_ref();
+        if query.is_none() || query.unwrap().trim().is_empty() {
+            let errors = vec![crate::error::Error::builder()
+                .message("Must provide query string.".to_string())
+                .extension_code("MISSING_QUERY_STRING")
+                .build()];
+            tracing::error!(
+                monotonic_counter.apollo_router_http_requests_total = 1u64,
+                status = %StatusCode::BAD_REQUEST.as_u16(),
+                error = "Must provide query string",
+                "Must provide query string"
+            );
+
+            Err(SupergraphResponse::builder()
+                .errors(errors)
+                .status_code(StatusCode::BAD_REQUEST)
+                .context(request.context)
+                .build()
+                .expect("response is valid"))
+        } else {
+            Ok(request)
+        }
+    })
 }
 
 // Process the headers to make sure that `VARY` is set correctly
