@@ -250,7 +250,7 @@ where
                                     // supergraph_request: http::Request::from_parts(parts, request),
                                     // context
                                     supergraph_request: http::Request::new(request),
-                                    context: Context::new()
+                                    context: context.clone()
                                 };
                                 match should_execute_request(
                                     apq.supergraph_request(supergraph_request).await
