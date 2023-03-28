@@ -271,6 +271,7 @@ where
                             // let first_response = supergraph_responses.first().unwrap();
 
                             let first_response_context = supergraph_responses.first().unwrap().context.clone();
+                            tracing::info!("first_response_context ACCEPTS_JSON_CONTEXT_KEY: {}", first_response_context.contains_key(ACCEPTS_JSON_CONTEXT_KEY));
                             first_response_context.insert(IS_BATCH_REQUEST_CONTEXT_KEY, true).unwrap();
 
                             // let (first_parts, _) =  first_response.response.into_parts();
